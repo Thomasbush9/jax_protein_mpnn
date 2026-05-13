@@ -1,12 +1,16 @@
 import jax
-import jax.numpy as jnp 
-import optax 
-import flax.nnx as nnx 
+import jax.numpy as jnp
+import optax
+import flax.nnx as nnx
+
+from features import CA_ProteinFeatures, ProteinFeatures, PositionalEncodings
+from layers import EncLayer, DecLayer, PositionWiseFeedForward, cat_neighbors_nodes
 
 
+# ==== Loss functions
 def loss_nll_jax(S, log_probs, mask):
-    '''Neg Likelihood loss: 
-    Input: 
+    '''Neg Likelihood loss:
+    Input:
         S: ground truth: (B, L)
         log_probs: predicted probs (B, L, C)
         mask: mask to positions that we care (B, L )
@@ -29,3 +33,12 @@ def loss_smoothed_jax(S, log_probs, mask, num_classes=21, weight=0.1):
     loss_av = jnp.sum(loss * mask) / jnp.sum(mask)
     return loss, loss_av
 
+
+class ProteinMPNN(nnx.Module):
+    def __init__(self):
+
+
+
+        pass
+    def __call__(self, x):
+        pass
