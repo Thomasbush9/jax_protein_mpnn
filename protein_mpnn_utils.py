@@ -1,21 +1,14 @@
 from __future__ import annotations
-import json, time, os, sys, glob , tqdm 
-import shutil
-import jax.numpy as jnp 
-import optax
-from flax import nnx 
+import numpy as np
+import jax.numpy as jnp
 
-
-from jax import Array 
+from jax import Array
 from jaxtyping import Array, Int, Float
-# torch data load 
-from torch.utils.data import DataLoader
-from torch.utils.data.dataset import random_split, Subset
 
-#extra utlities 
-import copy 
-import random 
-import itertools 
+import itertools
+
+ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
+N_AA = len(ALPHABET)  # 21
 
 # utility functions 
 #TODO can it be improved? 
@@ -41,7 +34,7 @@ def parse_fasta(filename, limit=-1, omit=[]):
 
 def _scores(S: Int[Array, "B L"], 
             log_probs: Float[Array, "B L V"],
-            mask: Float[Array, "B L"]) -> Float[Array "B"]:
+            mask: Float[Array, "B L"]) -> Float[Array, "B"]:
     """Negative log probabilities"""
     # here we have to use a gather function instead of nnl 
     loss = - jnp.take_along_axis(
@@ -53,13 +46,13 @@ def _scores(S: Int[Array, "B L"],
     return scores 
 
 def _S_to_seq(S, mask):
-    alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
+    alphabet = 'ACDEFGHIKLMjnpQRSTVWYX'
     seq = ''.join([alphabet[c] for c, m in zip(S.tolist(), mask.tolist()) if m>0])
     return seq
 
 def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
     '''
-        Input: x = PDB filename 
+        Ijnput: x = PDB filename 
         atoms = atoms to extract (optional)
     output: (length, atoms, coords=(x, y, z)) sequence
     '''
@@ -141,15 +134,15 @@ def parse_PDB_biounits(x, atoms=['N', 'CA', 'C'], chain=None):
     except TypeError:
         return 'no_chain', 'no_chain'
 
-def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
+def parse_PDB(path_to_pdb, ijnput_chain_list=None, ca_only=False):
     c=0
     pdb_dict_list = []
     init_alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G','H', 'I', 'J','K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T','U', 'V','W','X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g','h', 'i', 'j','k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't','u', 'v','w','x', 'y', 'z']
     extra_alphabet = [str(item) for item in list(jnp.arange(300))]
     chain_alphabet = init_alphabet + extra_alphabet
 
-    if input_chain_list:
-        chain_alphabet = input_chain_list
+    if ijnput_chain_list:
+        chain_alphabet = ijnput_chain_list
 
     biounit_names = [path_to_pdb]
     for biounit in biounit_names:
@@ -191,8 +184,270 @@ def parse_PDB(path_to_pdb, input_chain_list=None, ca_only=False):
             c+=1
         return pdb_dict_list
 
-#TODO: this function can be splitted into multiples
-def tied_featurize():
-    '''
-        Pack and pad batch into tensors
-    '''
+
+# ---------------------------------------------------------------------------
+# tied_featurize and helpers
+#
+# Design: all per-sample bookkeeping happens in NumPy (mutable buffers, easy
+# slice assignment). We only cast to jnp at the very end, for the tensors that
+# actually feed the model. JAX places arrays on accelerators implicitly, so
+# there is no `device=` argument anywhere — it's a no-op in JAX-land.
+# ---------------------------------------------------------------------------
+
+
+def _chain_lists(b, chain_dict):
+    """Return (masked_chains, visible_chains, all_chains) sorted alphabetically.
+
+    `chain_dict[name] = (masked, visible)` when provided; otherwise every chain
+    present in `b` is treated as masked.
+    """
+    if chain_dict is not None:
+        masked, visible = chain_dict[b["name"]]
+    else:
+        masked = [k[-1:] for k in b if k.startswith("seq_chain_")]
+        visible = []
+    masked = sorted(masked)
+    visible = sorted(visible)
+    return masked, visible, masked + visible
+
+
+def _chain_coords(coords, letter, ca_only):
+    """Stack backbone atoms for a single chain into [L_chain, n_atoms, 3]."""
+    if ca_only:
+        x = np.asarray(coords[f"CA_chain_{letter}"], dtype=np.float32)
+        if x.ndim == 2:
+            x = x[:, None, :]
+        return x  # [L_chain, 1, 3]
+    return np.stack(
+        [np.asarray(coords[f"{a}_chain_{letter}"], dtype=np.float32)
+         for a in ("N", "CA", "C", "O")],
+        axis=1,
+    )  # [L_chain, 4, 3]
+
+
+def _fixed_pos_mask(L_c, b, letter, fixed_position_dict):
+    """1.0 = position is free to be redesigned; 0.0 = fixed to wild-type AA."""
+    m = np.ones(L_c, dtype=np.float32)
+    if fixed_position_dict is not None:
+        fixed = fixed_position_dict[b["name"]][letter]
+        if fixed:
+            m[np.asarray(fixed) - 1] = 0.0  # 1-indexed → 0-indexed
+    return m
+
+
+def _omit_aa_mask(L_c, b, letter, omit_AA_dict):
+    """Per-position {0,1} matrix; a 1 forbids that AA at that position."""
+    m = np.zeros((L_c, N_AA), dtype=np.int32)
+    if omit_AA_dict is not None:
+        for pos_list, aa_letters in omit_AA_dict[b["name"]][letter]:
+            pos_idx = np.asarray(pos_list, dtype=np.int32) - 1
+            aa_idx = np.asarray([ALPHABET.index(a) for a in aa_letters],
+                                dtype=np.int32)
+            m[np.ix_(pos_idx, aa_idx)] = 1
+    return m
+
+
+def _pssm(L_c, b, letter, pssm_dict):
+    """PSSM tensors. Defaults: coef=0, bias=0, log_odds=+1e4 (no constraint)."""
+    coef = np.zeros(L_c, dtype=np.float32)
+    bias = np.zeros((L_c, 21), dtype=np.float32)
+    log_odds = 1e4 * np.ones((L_c, 21), dtype=np.float32)
+    if pssm_dict and pssm_dict[b["name"]][letter]:
+        entry = pssm_dict[b["name"]][letter]
+        coef = np.asarray(entry["pssm_coef"], dtype=np.float32)
+        bias = np.asarray(entry["pssm_bias"], dtype=np.float32)
+        log_odds = np.asarray(entry["pssm_log_odds"], dtype=np.float32)
+    return coef, bias, log_odds
+
+
+def _tied_positions(b, tied_positions_dict, letter_list, global_starts, L_max):
+    """Resolve symmetry constraints into flat global indices + per-position weights.
+
+    Returns:
+        tied_lists: list of lists; each inner list groups global indices that
+            must be decoded to the same AA (e.g. for homomers).
+        tied_beta: [L_max] float — relative weighting of each tied position
+            within its group (1.0 by default).
+    """
+    tied_beta = np.ones(L_max, dtype=np.float32)
+    tied_lists = []
+    if tied_positions_dict is None:
+        return tied_lists, tied_beta
+    tied_pos_list = tied_positions_dict[b["name"]]
+    if not tied_pos_list:
+        return tied_lists, tied_beta
+    letter_arr = np.asarray(letter_list)
+    for tied_item in tied_pos_list:
+        flat = []
+        for k, v in tied_item.items():
+            start = global_starts[int(np.argwhere(letter_arr == k)[0][0])]
+            if isinstance(v[0], list):  # (positions, weights)
+                positions, weights = v
+                for p, w in zip(positions, weights):
+                    flat.append(start + p - 1)
+                    tied_beta[start + p - 1] = w
+            else:
+                for p in v:
+                    flat.append(start + p - 1)
+        tied_lists.append(flat)
+    return tied_lists, tied_beta
+
+
+def _dihedral_mask(residue_idx):
+    """φ/ψ/ω validity from residue-index gaps. A dihedral is only well-defined
+    when the neighbouring residues are sequentially adjacent in the PDB."""
+    jumps = ((residue_idx[:, 1:] - residue_idx[:, :-1]) == 1).astype(np.float32)
+    phi = np.pad(jumps, [(0, 0), (1, 0)])    # needs (i-1, i)
+    psi = np.pad(jumps, [(0, 0), (0, 1)])    # needs (i, i+1)
+    omega = np.pad(jumps, [(0, 0), (0, 1)])  # needs (i, i+1)
+    return np.stack([phi, psi, omega], axis=-1)  # [B, L, 3]
+
+
+def tied_featurize(
+    batch,
+    chain_dict,
+    fixed_position_dict=None,
+    omit_AA_dict=None,
+    tied_positions_dict=None,
+    pssm_dict=None,
+    bias_by_res_dict=None,
+    ca_only=False,
+):
+    """Pack a list of parsed-PDB dicts into padded batch arrays for ProteinMPNN.
+
+    Returns a tuple of tensors (see model README for the full list); shapes
+    use B = batch size, L = L_max = longest concatenated chain in the batch.
+    """
+    B = len(batch)
+    lengths = np.array([len(b["seq"]) for b in batch], dtype=np.int32)
+    L_max = int(lengths.max())
+    n_atoms = 1 if ca_only else 4
+
+    # Per-batch padded buffers (numpy; mutable).
+    X = np.zeros((B, L_max, n_atoms, 3), dtype=np.float32)
+    S = np.zeros((B, L_max), dtype=np.int32)
+    chain_M = np.zeros((B, L_max), dtype=np.float32)
+    chain_M_pos = np.zeros((B, L_max), dtype=np.float32)
+    chain_encoding_all = np.zeros((B, L_max), dtype=np.int32)
+    residue_idx = -100 * np.ones((B, L_max), dtype=np.int32)
+    omit_AA_mask = np.zeros((B, L_max, N_AA), dtype=np.int32)
+    pssm_coef_all = np.zeros((B, L_max), dtype=np.float32)
+    pssm_bias_all = np.zeros((B, L_max, 21), dtype=np.float32)
+    pssm_log_odds_all = 1e4 * np.ones((B, L_max, 21), dtype=np.float32)
+    bias_by_res_all = np.zeros((B, L_max, 21), dtype=np.float32)
+    tied_beta_all = np.ones((B, L_max), dtype=np.float32)
+
+    letter_list_list, visible_list_list, masked_list_list = [], [], []
+    masked_chain_length_list_list = []
+    tied_pos_list_of_lists_list = []
+
+    for i, b in enumerate(batch):
+        masked, visible, all_chains = _chain_lists(b, chain_dict)
+
+        # Per-chain buffers, concatenated below.
+        xs, ms, seqs, encs = [], [], [], []
+        fixed, omit, bias_res = [], [], []
+        pcoef, pbias, plo = [], [], []
+        letter_list, visible_list, masked_list, masked_lengths = [], [], [], []
+        global_starts = [0]
+
+        c, l0 = 1, 0
+        for letter in all_chains:
+            is_masked = letter in masked
+            chain_seq = b[f"seq_chain_{letter}"].replace("-", "X")
+            L_c = len(chain_seq)
+            coords = b[f"coords_chain_{letter}"]
+
+            xs.append(_chain_coords(coords, letter, ca_only))
+            ms.append(np.ones(L_c, dtype=np.float32) if is_masked
+                      else np.zeros(L_c, dtype=np.float32))
+            seqs.append(chain_seq)
+            encs.append(c * np.ones(L_c, dtype=np.int32))
+
+            # residue_idx: +100 jump between chains so positional encoding sees a "break".
+            residue_idx[i, l0:l0 + L_c] = 100 * (c - 1) + np.arange(L_c)
+            global_starts.append(global_starts[-1] + L_c)
+
+            # Constraints only apply to masked (designable) chains.
+            fixed.append(
+                _fixed_pos_mask(L_c, b, letter,
+                                fixed_position_dict if is_masked else None))
+            omit.append(
+                _omit_aa_mask(L_c, b, letter,
+                              omit_AA_dict if is_masked else None))
+            cc, bb, lo = _pssm(L_c, b, letter,
+                               pssm_dict if is_masked else None)
+            pcoef.append(cc); pbias.append(bb); plo.append(lo)
+
+            if is_masked and bias_by_res_dict:
+                bias_res.append(np.asarray(
+                    bias_by_res_dict[b["name"]][letter], dtype=np.float32))
+            else:
+                bias_res.append(np.zeros((L_c, 21), dtype=np.float32))
+
+            letter_list.append(letter)
+            (masked_list if is_masked else visible_list).append(letter)
+            if is_masked:
+                masked_lengths.append(L_c)
+            c += 1
+            l0 += L_c
+
+        # Concatenate chains → one row of the padded batch.
+        x = np.concatenate(xs, 0)
+        all_seq = "".join(seqs)
+        L = len(all_seq)
+        X[i, :L] = x
+        chain_M[i, :L] = np.concatenate(ms, 0)
+        chain_M_pos[i, :L] = np.concatenate(fixed, 0)
+        chain_encoding_all[i, :L] = np.concatenate(encs, 0)
+        omit_AA_mask[i, :L] = np.concatenate(omit, 0)
+        pssm_coef_all[i, :L] = np.concatenate(pcoef, 0)
+        pssm_bias_all[i, :L] = np.concatenate(pbias, 0)
+        pssm_log_odds_all[i, :L] = np.concatenate(plo, 0)
+        bias_by_res_all[i, :L] = np.concatenate(bias_res, 0)
+        S[i, :L] = np.asarray([ALPHABET.index(a) for a in all_seq],
+                              dtype=np.int32)
+
+        tied_lists, tied_beta = _tied_positions(
+            b, tied_positions_dict, letter_list, global_starts, L_max)
+        tied_pos_list_of_lists_list.append(tied_lists)
+        tied_beta_all[i] = tied_beta
+
+        letter_list_list.append(letter_list)
+        visible_list_list.append(visible_list)
+        masked_list_list.append(masked_list)
+        masked_chain_length_list_list.append(masked_lengths)
+
+    # mask = 1 where every atom in the residue is finite (no missing coords).
+    mask = np.isfinite(X.sum(axis=(2, 3))).astype(np.float32)
+    X = np.where(np.isnan(X), 0.0, X)
+
+    dihedral_mask = _dihedral_mask(residue_idx)
+
+    X_out = X[:, :, 0] if ca_only else X
+
+    # Final cast: numpy → jnp. JAX handles device placement implicitly.
+    return (
+        jnp.asarray(X_out, dtype=jnp.float32),
+        jnp.asarray(S, dtype=jnp.int32),
+        jnp.asarray(mask, dtype=jnp.float32),
+        jnp.asarray(lengths, dtype=jnp.int32),
+        jnp.asarray(chain_M, dtype=jnp.float32),
+        jnp.asarray(chain_encoding_all, dtype=jnp.int32),
+        letter_list_list,
+        visible_list_list,
+        masked_list_list,
+        masked_chain_length_list_list,
+        jnp.asarray(chain_M_pos, dtype=jnp.float32),
+        jnp.asarray(omit_AA_mask, dtype=jnp.int32),
+        jnp.asarray(residue_idx, dtype=jnp.int32),
+        jnp.asarray(dihedral_mask, dtype=jnp.float32),
+        tied_pos_list_of_lists_list,
+        jnp.asarray(pssm_coef_all, dtype=jnp.float32),
+        jnp.asarray(pssm_bias_all, dtype=jnp.float32),
+        jnp.asarray(pssm_log_odds_all, dtype=jnp.float32),
+        jnp.asarray(bias_by_res_all, dtype=jnp.float32),
+        jnp.asarray(tied_beta_all, dtype=jnp.float32),
+    )
+
+
