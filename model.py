@@ -4,33 +4,13 @@ import flax.nnx as nnx
 
 from features import CA_ProteinFeatures, ProteinFeatures, gather_nodes
 from layers import EncoderStack, DecoderStack, cat_neighbors_nodes
-
-
-# ==== Loss functions
-def loss_nll_jax(S, log_probs, mask):
-    '''Neg Likelihood loss:
-    Input:
-        S: ground truth: (B, L)
-        log_probs: predicted probs (B, L, C)
-        mask: mask to positions that we care (B, L )
-    '''
-    loss = -jnp.take_along_axis(
-        log_probs.reshape(-1, log_probs.shape[-1]),
-        S.reshape(-1, 1),
-        axis=-1
-    ).reshape(S.shape)
-    loss_av = jnp.sum(loss*mask) / jnp.sum(mask)
-    return loss, loss_av
-
-def loss_smoothed_jax(S, log_probs, mask, num_classes=21, weight=0.1):
-    S_onehot = jax.nn.one_hot(S, num_classes=num_classes)
-
-    S_onehot = S_onehot + weight / S_onehot.shape[-1]
-    S_onehot = S_onehot / S_onehot.sum(-1, keepdims=True)
-
-    loss = - (S_onehot*log_probs).sum(-1)
-    loss_av = jnp.sum(loss * mask) / jnp.sum(mask)
-    return loss, loss_av
+from losses import loss_nll_jax, loss_smoothed_jax
+from decoding import (
+    sample_decode,
+    tied_sample_decode,
+    conditional_probs_decode,
+    unconditional_probs_decode,
+)
 
 class ProteinMPNN(nnx.Module):
     def __init__(self, num_letters, node_features, edge_features,
@@ -81,63 +61,172 @@ class ProteinMPNN(nnx.Module):
 
     def __call__(
         self,
-        atom_coords,
+        edge_features,
+        neighbor_idx,
         sequence_tokens,
         residue_mask,
         decode_mask,
-        residue_idx,
-        chain_ids,
         decode_noise,
         use_input_decoding_order=False,
         decoding_order=None,
     ):
-        '''Graph-conditioned sequence model'''
-        #TODO: I think that we can move the feature creation to a pre-processing step
-        edge_features, neighbor_idx = self.features(atom_coords, residue_mask, residue_idx, chain_ids)
-        if edge_features.shape[-1] != self.hidden_dim:
-            raise ValueError(f"Expected edge feature dim {self.hidden_dim}, got {edge_features.shape[-1]}")
-        node_hidden = jnp.zeros((edge_features.shape[0], edge_features.shape[1], edge_features.shape[-1]), dtype=edge_features.dtype)
-        edge_hidden = self.W_e(edge_features)
+        """Graph-conditioned sequence model training forward pass.
 
-        # encoder -> unmasked self attention 
+        Args:
+            edge_features: [B, N, K, edge_features]
+            neighbor_idx: [B, N, K]
+            sequence_tokens: [B, N]
+            residue_mask: [B, N]
+            decode_mask: [B, N]
+            decode_noise: [B, N]
+        """
+        if sequence_tokens.ndim != 2:
+            raise ValueError("sequence_tokens must have shape [B, N]")
+        if residue_mask.shape != sequence_tokens.shape:
+            raise ValueError("residue_mask shape must match sequence_tokens shape")
+        encoded_node_hidden, encoded_edge_hidden = self._encode_graph(
+            edge_features=edge_features,
+            neighbor_idx=neighbor_idx,
+            residue_mask=residue_mask,
+        )
+        sequence_hidden = self.W_s(sequence_tokens)
+        seq_edge_hidden = cat_neighbors_nodes(sequence_hidden, encoded_edge_hidden, neighbor_idx)
+        encoder_node_edge_context = self._build_encoder_context(
+            encoded_node_hidden=encoded_node_hidden,
+            encoded_edge_hidden=encoded_edge_hidden,
+            neighbor_idx=neighbor_idx,
+            sequence_hidden_template=sequence_hidden,
+        )
+        decoding_order, decoder_backward_mask, decoder_forward_mask = self._build_decoder_masks(
+            neighbor_idx=neighbor_idx,
+            residue_mask=residue_mask,
+            decode_mask=decode_mask,
+            decode_noise=decode_noise,
+            use_input_decoding_order=use_input_decoding_order,
+            decoding_order=decoding_order,
+        )
+        del decoding_order
+        encoder_context_forward_masked = decoder_forward_mask * encoder_node_edge_context
+        decoded_node_hidden = self._run_decoder(
+            node_hidden_init=encoded_node_hidden,
+            seq_edge_hidden=seq_edge_hidden,
+            neighbor_idx=neighbor_idx,
+            decoder_backward_mask=decoder_backward_mask,
+            encoder_context_forward_masked=encoder_context_forward_masked,
+            residue_mask=residue_mask,
+        )
+        logits = self.W_out(decoded_node_hidden)
+        return jax.nn.log_softmax(logits, axis=-1)
+
+    def _encode_graph(self, edge_features, neighbor_idx, residue_mask):
+        """Encode structure graph into node/edge hidden states."""
+        if edge_features.shape[-1] != self.edge_features:
+            raise ValueError(
+                f"Expected edge feature dim {self.edge_features}, got {edge_features.shape[-1]}"
+            )
+        if neighbor_idx.ndim != 3:
+            raise ValueError("neighbor_idx must have shape [B, N, K]")
+        node_hidden = jnp.zeros(
+            (edge_features.shape[0], edge_features.shape[1], self.hidden_dim),
+            dtype=edge_features.dtype,
+        )
+        edge_hidden = self.W_e(edge_features)
         attend_mask = gather_nodes(residue_mask[..., None], neighbor_idx).squeeze(axis=-1)
         attend_mask = residue_mask[..., None] * attend_mask
-        
-        node_hidden, edge_hidden = self.encoder_layers(node_hidden, edge_hidden, neighbor_idx, attend_mask, residue_mask)
-        sequence_hidden = self.W_s(sequence_tokens)
-        seq_edge_hidden = cat_neighbors_nodes(sequence_hidden, edge_hidden, neighbor_idx)
+        encoded_node_hidden, encoded_edge_hidden = self.encoder_layers(
+            node_hidden, edge_hidden, neighbor_idx, attend_mask, residue_mask
+        )
+        return encoded_node_hidden, encoded_edge_hidden
 
-        encoder_edge_context = cat_neighbors_nodes(jnp.zeros_like(sequence_hidden), edge_hidden, neighbor_idx)
-        encoder_node_edge_context = cat_neighbors_nodes(node_hidden, encoder_edge_context, neighbor_idx)
+    def _encode_graph_from_structure(self, atom_coords, residue_mask, residue_idx, chain_ids):
+        """Compatibility path for decode APIs that still accept raw structure inputs."""
+        edge_features, neighbor_idx = self.features(atom_coords, residue_mask, residue_idx, chain_ids)
+        encoded_node_hidden, encoded_edge_hidden = self._encode_graph(
+            edge_features=edge_features,
+            neighbor_idx=neighbor_idx,
+            residue_mask=residue_mask,
+        )
+        return neighbor_idx, encoded_node_hidden, encoded_edge_hidden
 
+    def _build_decoder_masks(
+        self,
+        neighbor_idx,
+        residue_mask,
+        decode_mask,
+        decode_noise,
+        use_input_decoding_order=False,
+        decoding_order=None,
+    ):
+        """Build autoregressive decoder masks and decode order."""
         decode_mask = decode_mask * residue_mask
-        if not use_input_decoding_order:
-            decoding_order = jnp.argsort((decode_mask + 0.000_1) * (jnp.abs(decode_noise)))
+        if (not use_input_decoding_order) or (decoding_order is None):
+            decoding_order = jnp.argsort((decode_mask + 0.000_1) * jnp.abs(decode_noise), axis=-1)
         mask_size = neighbor_idx.shape[1]
         permutation_matrix_reverse = jax.nn.one_hot(
             decoding_order.astype(jnp.int32), num_classes=mask_size, dtype=jnp.float32
         )
-        lower_tri = 1.0 - jnp.triu(jnp.ones((mask_size, mask_size), dtype=permutation_matrix_reverse.dtype))
+        lower_tri = 1.0 - jnp.triu(jnp.ones((mask_size, mask_size), dtype=jnp.float32))
         order_mask_backward = jnp.einsum(
             "ij,biq,bjp->bqp",
             lower_tri,
             permutation_matrix_reverse,
             permutation_matrix_reverse,
-        )  # [B, L, L]
-
-        decoder_attend_mask = jnp.take_along_axis(order_mask_backward, neighbor_idx, axis=2)[..., None]  # [B, L, K, 1]
+        )
+        decoder_attend_mask = jnp.take_along_axis(order_mask_backward, neighbor_idx, axis=2)[..., None]
         node_mask_1d = residue_mask[..., None, None]
         decoder_backward_mask = node_mask_1d * decoder_attend_mask
-        decoder_forward_mask = node_mask_1d * (1. - decoder_attend_mask)
+        decoder_forward_mask = node_mask_1d * (1.0 - decoder_attend_mask)
+        return decoding_order, decoder_backward_mask, decoder_forward_mask
 
-        encoder_context_forward_masked = decoder_forward_mask * encoder_node_edge_context
+    def _build_encoder_context(
+        self, encoded_node_hidden, encoded_edge_hidden, neighbor_idx, sequence_hidden_template
+    ):
+        """Build encoder node-edge context for decoder skip pathway."""
+        zero_sequence_hidden = jnp.zeros_like(sequence_hidden_template)
+        encoder_edge_context = cat_neighbors_nodes(
+            zero_sequence_hidden, encoded_edge_hidden, neighbor_idx
+        )
+        return cat_neighbors_nodes(encoded_node_hidden, encoder_edge_context, neighbor_idx)
+
+    def _run_decoder(
+        self,
+        node_hidden_init,
+        seq_edge_hidden,
+        neighbor_idx,
+        decoder_backward_mask,
+        encoder_context_forward_masked,
+        residue_mask,
+    ):
+        """Run decoder stack over prepared sequence/edge context."""
+        decoder_node_hidden = node_hidden_init
         for layer in self.decoder_layers.decoder_layers:
-            decoder_node_seq_edge_context = cat_neighbors_nodes(node_hidden, seq_edge_hidden, neighbor_idx)
-            decoder_node_seq_edge_context = (
-                decoder_backward_mask * decoder_node_seq_edge_context + encoder_context_forward_masked
+            decoder_context = cat_neighbors_nodes(decoder_node_hidden, seq_edge_hidden, neighbor_idx)
+            decoder_context = decoder_backward_mask * decoder_context + encoder_context_forward_masked
+            decoder_node_hidden = layer(
+                node_hidden=decoder_node_hidden,
+                edge_hidden=decoder_context,
+                node_mask=residue_mask,
             )
-            node_hidden = layer(node_hidden=node_hidden, edge_hidden=decoder_node_seq_edge_context, node_mask=residue_mask)
+        return decoder_node_hidden
 
-        logits = self.W_out(node_hidden)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        return log_probs
+
+    def sample(self, *args, **kwargs):
+        """Autoregressive constrained sequence sampling."""
+        return sample_decode(self, *args, **kwargs)
+
+
+
+
+    def tied_sample(self, *args, **kwargs):
+        """Autoregressive tied-position constrained sampling."""
+        return tied_sample_decode(self, *args, **kwargs)
+
+        
+
+    def conditional_probs(self, *args, **kwargs):
+        """Compute per-position conditional log-probabilities."""
+        return conditional_probs_decode(self, *args, **kwargs)
+
+    def unconditional_probs(self, *args, **kwargs):
+        """Compute unconditional log-probabilities."""
+        return unconditional_probs_decode(self, *args, **kwargs)

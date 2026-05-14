@@ -7,7 +7,10 @@ import einops
 #===== Gather functions
 
 def gather_edges(edge_tensor, neighbor_idx):
-    # features [B, N, N , C] n_idx [B, N, K] -> neighbor features [B, N, K, C]
+    """Gather pairwise edge tensor along neighbor indices.
+
+    edge_tensor: [B, N, N, C], neighbor_idx: [B, N, K] -> [B, N, K, C]
+    """
 
     idx = neighbor_idx[..., None]                        # (B, N, K, 1)
     idx = jnp.broadcast_to(idx, (*neighbor_idx.shape, edge_tensor.shape[-1]))  # (B, N, K, C)
@@ -15,7 +18,10 @@ def gather_edges(edge_tensor, neighbor_idx):
     return edge_features
 
 def gather_nodes(node_tensor, neighbor_idx):
-    # nodes: [B, N, C], neighbor_idx: [B, N, K] -> [B, N, K, C]
+    """Gather node tensor at neighbor indices.
+
+    node_tensor: [B, N, C], neighbor_idx: [B, N, K] -> [B, N, K, C]
+    """
     b, n, k = neighbor_idx.shape
     c = node_tensor.shape[-1]
     idx = einops.rearrange(neighbor_idx, 'b n k -> b (n k)')   # [B, NK]
@@ -28,7 +34,10 @@ def gather_nodes(node_tensor, neighbor_idx):
     return neighbor_features
 
 def gather_nodes_t(node_tensor, neighbor_idx):
-    # features [B, N, C] a N_idx [B, K] -> neighbor_features [B, K, C]
+    """Gather node tensor for a flat per-batch index list.
+
+    node_tensor: [B, N, C], neighbor_idx: [B, K] -> [B, K, C]
+    """
     b, n, c = node_tensor.shape
     _, k = neighbor_idx.shape
     idx_flat = neighbor_idx[..., None]
@@ -50,6 +59,10 @@ class PositionalEncodings(nnx.Module):
         )
 
     def __call__(self, residue_offset, same_chain_mask):
+        """Relative positional edge encoding.
+
+        residue_offset: [B, N, K], same_chain_mask: [B, N, K]
+        """
         d = jnp.clip(residue_offset + self.max_relative_feature, 0, 2*self.max_relative_feature) * same_chain_mask
         d_onehot = jax.nn.one_hot(d, num_classes=2*self.max_relative_feature+1+1)
         positional_features = self.linear(d_onehot)
@@ -191,6 +204,8 @@ class CA_ProteinFeatures(nnx.Module):
 
     def __call__(self, ca_coords, mask, residue_idx, chain_labels, noise_key=None):
         """ Featurize coordinates as an attributed graph """
+        if ca_coords.ndim != 3 or ca_coords.shape[-1] != 3:
+            raise ValueError("CA features expect ca_coords with shape [B, N, 3]")
         if self.augment_eps > 0 and noise_key is not None:
             ca_coords = ca_coords + self.augment_eps * jax.random.normal(noise_key, shape=ca_coords.shape, dtype=ca_coords.dtype)
 
@@ -281,6 +296,12 @@ class ProteinFeatures(nnx.Module):
         return rbf_features
 
     def __call__(self, atom_coords, mask, residue_idx, chain_labels, noise_key=None):
+        """Featurize backbone atom coordinates into edge features.
+
+        atom_coords: [B, N, 4, 3] using (N, CA, C, O) atom order.
+        """
+        if atom_coords.ndim != 4 or atom_coords.shape[-2:] != (4, 3):
+            raise ValueError("ProteinFeatures expects atom_coords with shape [B, N, 4, 3]")
         if self.augment_eps > 0 and noise_key is not None:
             atom_coords = atom_coords + self.augment_eps * jax.random.normal(noise_key, shape=atom_coords.shape, dtype=atom_coords.dtype)
 

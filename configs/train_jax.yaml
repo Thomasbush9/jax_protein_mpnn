@@ -1,0 +1,30 @@
+data:
+  path: /Users/thom/Projects/jax_protein_mpnn/precomputed_dataset_small
+  max_examples: 32
+  max_length: 256
+
+training:
+  output_dir: ./outputs_jax_train
+  num_epochs: 2
+  tokens_per_batch: 512
+  warmup_steps: 4000
+  clip_grad_norm: 1.0
+  seed: 0
+  precision: float32
+  dropout: 0.0
+
+model:
+  hidden_dim: 128
+  edge_dim: 128
+  num_encoder_layers: 3
+  num_decoder_layers: 3
+  k_neighbors: 48
+
+wandb:
+  enabled: false
+  entity: your_wandb_account
+  project: proteinmpnn-jax
+  run_id: test-run-001
+  run_name: jax-smoke
+  mode: online
+  tags: [jax, proteinmpnn, training]

@@ -6,6 +6,13 @@ from features import gather_nodes
 
 
 def cat_neighbors_nodes(node_hidden, neighbor_hidden, neighbor_idx):
+    """Concatenate neighbor edge states with gathered node states.
+
+    Args:
+        node_hidden: [B, N, H]
+        neighbor_hidden: [B, N, K, H_e]
+        neighbor_idx: [B, N, K]
+    """
     gathered_node_hidden = gather_nodes(node_hidden, neighbor_idx)
     concatenated_hidden = jnp.concatenate([neighbor_hidden, gathered_node_hidden], axis=-1)
     return concatenated_hidden
@@ -26,6 +33,7 @@ class PositionWiseFeedForward(nnx.Module):
         self.act = jax.nn.gelu
 
     def __call__(self, node_hidden):
+        """Apply FFN on node hidden states [B, N, H]."""
         hidden = self.act(self.W_in(node_hidden))
         hidden = self.W_out(hidden)
         return hidden
@@ -79,7 +87,10 @@ class EncLayer(nnx.Module):
 
 
     def __call__(self, node_hidden, edge_hidden, neighbor_idx, node_mask=None, attend_mask=None):
-        '''Parallel computation of full transformer layer'''
+        """Parallel encoder layer update.
+
+        node_hidden: [B, N, H], edge_hidden: [B, N, K, H_e], neighbor_idx: [B, N, K]
+        """
 
         node_edge_hidden = cat_neighbors_nodes(node_hidden, edge_hidden, neighbor_idx)
         node_edge_shape = node_edge_hidden.shape
@@ -100,7 +111,7 @@ class EncLayer(nnx.Module):
             node_mask = node_mask[..., None]
             node_hidden = node_mask * node_hidden
         node_edge_hidden = cat_neighbors_nodes(node_hidden, edge_hidden, neighbor_idx)
-        node_hidden_expanded = jnp.broadcast_to(node_hidden[..., None], expanded_node_shape)
+        node_hidden_expanded = jnp.broadcast_to(node_hidden[:, :, None, :], expanded_node_shape)
         node_edge_hidden = jnp.concatenate([node_hidden_expanded, node_edge_hidden], axis=-1)
         message_hidden = self.W13(self.act(self.W12(self.act(self.W11(node_edge_hidden)))))
         edge_hidden = self.norm3(edge_hidden + self.dropout3(message_hidden))
@@ -136,13 +147,16 @@ class DecLayer(nnx.Module):
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden*4, rngs=rngs)
 
     def __call__(self, node_hidden, edge_hidden, node_mask=None, attend_mask=None):
-        '''Parallel computation of full transformer layer'''
+        """Parallel decoder layer update.
+
+        node_hidden: [B, N, H], edge_hidden: [B, N, K, H_e]
+        """
 
         node_shape = node_hidden.shape
         edge_shape = edge_hidden.shape
         expanded_node_shape = node_shape[:2] + (edge_shape[2],) + node_shape[2:]
 
-        node_hidden_expanded = jnp.broadcast_to(node_hidden[..., None], expanded_node_shape)
+        node_hidden_expanded = jnp.broadcast_to(node_hidden[:, :, None, :], expanded_node_shape)
 
         node_edge_hidden = jnp.concatenate([node_hidden_expanded, edge_hidden], axis=-1)
 
@@ -164,12 +178,13 @@ class DecLayer(nnx.Module):
 
 class EncoderStack(nnx.Module):
     def __init__(self, num_layers: int, hidden_dim: int, dropout: float, rngs: nnx.Rngs) -> None:
-        self.encoder_stack = [
+        self.encoder_stack = nnx.List([
             EncLayer(hidden_dim, hidden_dim * 2, dropout=dropout, rngs=rngs)
             for _ in range(num_layers)
-        ]
+        ])
 
     def __call__(self, node_hidden, edge_hidden, neighbor_idx, attend_mask, node_mask):
+        """Apply all encoder layers sequentially."""
         for layer in self.encoder_stack:
             node_hidden, edge_hidden = layer(
                 edge_hidden=edge_hidden,
@@ -183,12 +198,13 @@ class EncoderStack(nnx.Module):
 
 class DecoderStack(nnx.Module):
     def __init__(self, num_layers: int, hidden_dim: int, dropout: float, rngs: nnx.Rngs) -> None:
-        self.decoder_layers = [
+        self.decoder_layers = nnx.List([
             DecLayer(hidden_dim, hidden_dim * 3, dropout=dropout, rngs=rngs)
             for _ in range(num_layers)
-        ]
+        ])
 
     def __call__(self, node_hidden, edge_hidden, node_mask=None):
+        """Apply all decoder layers sequentially."""
         for layer in self.decoder_layers:
             node_hidden = layer(node_hidden=node_hidden, edge_hidden=edge_hidden, node_mask=node_mask)
         return node_hidden
