@@ -5,28 +5,38 @@ import flax.nnx as nnx
 from features import gather_nodes
 
 
-def cat_neighbors_nodes(h_nodes, h_neighbors, E_idx):
-    h_nodes = gather_nodes(h_nodes, E_idx)
-    h_nn = jnp.concatenate([h_neighbors, h_nodes], axis=-1)
-    return h_nn
+def cat_neighbors_nodes(node_hidden, neighbor_hidden, neighbor_idx):
+    gathered_node_hidden = gather_nodes(node_hidden, neighbor_idx)
+    concatenated_hidden = jnp.concatenate([neighbor_hidden, gathered_node_hidden], axis=-1)
+    return concatenated_hidden
 
 
 class PositionWiseFeedForward(nnx.Module):
     def __init__(self, num_hidden, num_ff, rngs:nnx.Rngs):
-        self.W_in = nnx.Linear(num_hidden, num_ff, use_bias=True, rngs=rngs)
-        self.W_out = nnx.Linear(num_ff, num_hidden, use_bias=True, rngs=rngs)
+        kernel_init = jax.nn.initializers.glorot_uniform()
+        bias_init = jax.nn.initializers.zeros
+        self.W_in = nnx.Linear(
+            num_hidden, num_ff, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W_out = nnx.Linear(
+            num_ff, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
         self.act = jax.nn.gelu
 
-    def __call__(self, h_V):
-        h = self.act(self.W_in(h_V))
-        h = self.W_out(h)
-        return h
+    def __call__(self, node_hidden):
+        hidden = self.act(self.W_in(node_hidden))
+        hidden = self.W_out(hidden)
+        return hidden
 
 
 #=== Encoder-Decoder Layers
 class EncLayer(nnx.Module):
     def __init__(self, num_hidden, num_in, rngs: nnx.Rngs, dropout=.01, num_heads=None, scale=30) -> None:
         super().__init__()
+        kernel_init = jax.nn.initializers.glorot_uniform()
+        bias_init = jax.nn.initializers.zeros
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
@@ -39,48 +49,67 @@ class EncLayer(nnx.Module):
         self.norm2 = nnx.LayerNorm(num_hidden, rngs=rngs)
         self.norm3 = nnx.LayerNorm(num_hidden, rngs=rngs)
 
-        self.W1 = nnx.Linear(num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs)
-        self.W2 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
-        self.W3 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
+        self.W1 = nnx.Linear(
+            num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W2 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W3 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
 
-        self.W11 = nnx.Linear(num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs)
-        self.W12 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
-        self.W13 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
+        self.W11 = nnx.Linear(
+            num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W12 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W13 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
         self.act = jax.nn.gelu
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden*4, rngs=rngs) #TODO: check which layer add
 
 
-    def __call__(self, h_V, h_E, E_idx, mask_V=None, mask_attend=None):
+    def __call__(self, node_hidden, edge_hidden, neighbor_idx, node_mask=None, attend_mask=None):
         '''Parallel computation of full transformer layer'''
 
-        h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
-        h_ev_shape = h_EV.shape
-        h_v_shape = h_V.shape
-        h_v_exp_shape = h_v_shape[:2] + (h_ev_shape[2],) + h_v_shape[2:]
-        h_V_expand = jnp.broadcast_to(h_V[:, :, None, ...], h_v_exp_shape)
-        h_EV = jnp.concatenate([h_V_expand, h_EV], axis=-1)
-        h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
-        if mask_attend is not None:
-            h_message = mask_attend[..., None] * h_message
-        dh = jnp.sum(h_message, axis=-2) / self.scale
-        h_V = self.norm1(h_V + self.dropout1(dh))
+        node_edge_hidden = cat_neighbors_nodes(node_hidden, edge_hidden, neighbor_idx)
+        node_edge_shape = node_edge_hidden.shape
+        node_shape = node_hidden.shape
+        expanded_node_shape = node_shape[:2] + (node_edge_shape[2],) + node_shape[2:]
+        node_hidden_expanded = jnp.broadcast_to(node_hidden[:, :, None, ...], expanded_node_shape)
+        node_edge_hidden = jnp.concatenate([node_hidden_expanded, node_edge_hidden], axis=-1)
+        message_hidden = self.W3(self.act(self.W2(self.act(self.W1(node_edge_hidden)))))
+        if attend_mask is not None:
+            message_hidden = attend_mask[..., None] * message_hidden
+        node_delta = jnp.sum(message_hidden, axis=-2) / self.scale
+        node_hidden = self.norm1(node_hidden + self.dropout1(node_delta))
 
-        dh = self.dense(h_V)
-        h_V = self.norm2(h_V + self.dropout2(dh))
+        node_delta = self.dense(node_hidden)
+        node_hidden = self.norm2(node_hidden + self.dropout2(node_delta))
 
-
-        if mask_V is not None:
-            mask_V = mask_V[..., None]
-            h_V = mask_V * h_V
-        h_EV = cat_neighbors_nodes(h_V, h_E, E_idx)
-        h_V_expand = jnp.broadcast_to(h_V[..., None], h_v_exp_shape)
-        h_EV = jnp.concatenate([h_V_expand, h_EV], axis=-1)
-        h_message = self.W13(self.act(self.W12(self.act(self.W11(h_EV)))))
-        h_E = self.norm3(h_E + self.dropout3(h_message))
-        return h_V, h_E
+        if node_mask is not None:
+            node_mask = node_mask[..., None]
+            node_hidden = node_mask * node_hidden
+        node_edge_hidden = cat_neighbors_nodes(node_hidden, edge_hidden, neighbor_idx)
+        node_hidden_expanded = jnp.broadcast_to(node_hidden[..., None], expanded_node_shape)
+        node_edge_hidden = jnp.concatenate([node_hidden_expanded, node_edge_hidden], axis=-1)
+        message_hidden = self.W13(self.act(self.W12(self.act(self.W11(node_edge_hidden)))))
+        edge_hidden = self.norm3(edge_hidden + self.dropout3(message_hidden))
+        return node_hidden, edge_hidden
 
 class DecLayer(nnx.Module):
     def __init__(self, num_hidden, num_in, rngs: nnx.Rngs, dropout=.01, num_heads=None, scale=30) -> None:
+        kernel_init = jax.nn.initializers.glorot_uniform()
+        bias_init = jax.nn.initializers.zeros
         self.num_hidden = num_hidden
         self.num_in = num_in
         self.scale = scale
@@ -91,34 +120,75 @@ class DecLayer(nnx.Module):
         self.norm1 = nnx.LayerNorm(num_hidden, rngs=rngs)
         self.norm2 = nnx.LayerNorm(num_hidden, rngs=rngs)
 
-        self.W1 = nnx.Linear(num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs)
-        self.W2 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
-        self.W3 = nnx.Linear(num_hidden, num_hidden, use_bias=True, rngs=rngs)
+        self.W1 = nnx.Linear(
+            num_hidden + num_in, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W2 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
+        self.W3 = nnx.Linear(
+            num_hidden, num_hidden, use_bias=True, rngs=rngs,
+            kernel_init=kernel_init, bias_init=bias_init
+        )
         self.act = jax.nn.gelu
         self.dense = PositionWiseFeedForward(num_hidden, num_hidden*4, rngs=rngs)
 
-    def __call__(self, h_V, h_E, mask_V=None, mask_attend=None):
+    def __call__(self, node_hidden, edge_hidden, node_mask=None, attend_mask=None):
         '''Parallel computation of full transformer layer'''
 
-        h_v_shape = h_V.shape
-        h_e_shape = h_E.shape
-        h_v_exp_shape = h_v_shape[:2] + (h_e_shape[2],) + h_v_shape[2:]
+        node_shape = node_hidden.shape
+        edge_shape = edge_hidden.shape
+        expanded_node_shape = node_shape[:2] + (edge_shape[2],) + node_shape[2:]
 
-        h_V_expand = jnp.broadcast_to(h_V[..., None], h_v_exp_shape)
+        node_hidden_expanded = jnp.broadcast_to(node_hidden[..., None], expanded_node_shape)
 
-        h_EV = jnp.concatenate([h_V_expand, h_E], axis=-1)
+        node_edge_hidden = jnp.concatenate([node_hidden_expanded, edge_hidden], axis=-1)
 
-        h_message = self.W3(self.act(self.W2(self.act(self.W1(h_EV)))))
-        if mask_attend is not None:
-            h_message = mask_attend[..., None] * h_message
-        dh = jnp.sum(h_message, axis=-2) / self.scale
+        message_hidden = self.W3(self.act(self.W2(self.act(self.W1(node_edge_hidden)))))
+        if attend_mask is not None:
+            message_hidden = attend_mask[..., None] * message_hidden
+        node_delta = jnp.sum(message_hidden, axis=-2) / self.scale
 
-        h_V = self.norm1(h_V + self.dropout1(dh))
+        node_hidden = self.norm1(node_hidden + self.dropout1(node_delta))
 
         # position-wise feed forward:
-        dh = self.dense(h_V)
-        h_V = self.norm2(h_V + self.dropout2(dh))
+        node_delta = self.dense(node_hidden)
+        node_hidden = self.norm2(node_hidden + self.dropout2(node_delta))
 
-        if mask_V is not None:
-            h_V = mask_V[..., None] * h_V
-        return h_V
+        if node_mask is not None:
+            node_hidden = node_mask[..., None] * node_hidden
+        return node_hidden
+
+
+class EncoderStack(nnx.Module):
+    def __init__(self, num_layers: int, hidden_dim: int, dropout: float, rngs: nnx.Rngs) -> None:
+        self.encoder_stack = [
+            EncLayer(hidden_dim, hidden_dim * 2, dropout=dropout, rngs=rngs)
+            for _ in range(num_layers)
+        ]
+
+    def __call__(self, node_hidden, edge_hidden, neighbor_idx, attend_mask, node_mask):
+        for layer in self.encoder_stack:
+            node_hidden, edge_hidden = layer(
+                edge_hidden=edge_hidden,
+                node_hidden=node_hidden,
+                neighbor_idx=neighbor_idx,
+                attend_mask=attend_mask,
+                node_mask=node_mask,
+            )
+        return node_hidden, edge_hidden
+
+
+class DecoderStack(nnx.Module):
+    def __init__(self, num_layers: int, hidden_dim: int, dropout: float, rngs: nnx.Rngs) -> None:
+        self.decoder_layers = [
+            DecLayer(hidden_dim, hidden_dim * 3, dropout=dropout, rngs=rngs)
+            for _ in range(num_layers)
+        ]
+
+    def __call__(self, node_hidden, edge_hidden, node_mask=None):
+        for layer in self.decoder_layers:
+            node_hidden = layer(node_hidden=node_hidden, edge_hidden=edge_hidden, node_mask=node_mask)
+        return node_hidden
