@@ -4,9 +4,11 @@ import argparse
 import csv
 import json
 import math
+import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import flax.nnx as nnx
 import jax
@@ -46,14 +48,24 @@ def _collate_batch(
     examples: list[GraphExample],
     edge_dim: int,
     k_neighbors: int,
-    dtype: jnp.dtype,
-) -> dict[str, jnp.ndarray]:
+    bucket_lengths: list[int] | None = None,
+) -> dict[str, np.ndarray | int]:
     max_len = max(example.sequence_tokens.shape[0] for example in examples)
+    if bucket_lengths:
+        target_len = max_len
+        for bucket in sorted(bucket_lengths):
+            if max_len <= bucket:
+                target_len = bucket
+                break
+    else:
+        target_len = max_len
+
     edge_batch = []
     idx_batch = []
     seq_batch = []
     residue_mask_batch = []
     decode_mask_batch = []
+    token_count = 0
     for ex in examples:
         length = ex.sequence_tokens.shape[0]
         if ex.edge_features.shape != (length, k_neighbors, edge_dim):
@@ -64,17 +76,21 @@ def _collate_batch(
             raise ValueError(
                 f"{ex.name}: neighbor_idx shape {ex.neighbor_idx.shape} must be ({length}, {k_neighbors})"
             )
-        edge_batch.append(_pad_axis0(ex.edge_features, max_len, 0.0))
-        idx_batch.append(_pad_axis0(ex.neighbor_idx, max_len, 0))
-        seq_batch.append(_pad_axis0(ex.sequence_tokens, max_len, 0))
-        residue_mask_batch.append(_pad_axis0(ex.residue_mask, max_len, 0.0))
-        decode_mask_batch.append(_pad_axis0(ex.decode_mask, max_len, 0.0))
+        edge_batch.append(_pad_axis0(ex.edge_features, target_len, 0.0))
+        idx_batch.append(_pad_axis0(ex.neighbor_idx, target_len, 0))
+        seq_batch.append(_pad_axis0(ex.sequence_tokens, target_len, 0))
+        residue_mask_batch.append(_pad_axis0(ex.residue_mask, target_len, 0.0))
+        decode_mask_batch.append(_pad_axis0(ex.decode_mask, target_len, 0.0))
+        token_count += int(np.sum(ex.residue_mask > 0.5))
+
     return {
-        "edge_features": jnp.asarray(np.stack(edge_batch, axis=0), dtype=dtype),
-        "neighbor_idx": jnp.asarray(np.stack(idx_batch, axis=0), dtype=jnp.int32),
-        "sequence_tokens": jnp.asarray(np.stack(seq_batch, axis=0), dtype=jnp.int32),
-        "residue_mask": jnp.asarray(np.stack(residue_mask_batch, axis=0), dtype=jnp.float32),
-        "decode_mask": jnp.asarray(np.stack(decode_mask_batch, axis=0), dtype=jnp.float32),
+        "edge_features": np.stack(edge_batch, axis=0).astype(np.float32),
+        "neighbor_idx": np.stack(idx_batch, axis=0).astype(np.int32),
+        "sequence_tokens": np.stack(seq_batch, axis=0).astype(np.int32),
+        "residue_mask": np.stack(residue_mask_batch, axis=0).astype(np.float32),
+        "decode_mask": np.stack(decode_mask_batch, axis=0).astype(np.float32),
+        "token_count": token_count,
+        "padded_length": int(target_len),
     }
 
 
@@ -356,6 +372,33 @@ def _metric_from_sums(nll_sum: float, correct_sum: float, token_count: float) ->
     return {"nll": nll, "perplexity": ppl, "accuracy": acc}
 
 
+def _prefetch_to_device(
+    host_batches: Iterator[dict[str, np.ndarray | int]],
+    prefetch_depth: int,
+    dtype: jnp.dtype,
+) -> Iterator[dict[str, jnp.ndarray | int]]:
+    depth = max(1, int(prefetch_depth))
+
+    def _to_device(batch: dict[str, np.ndarray | int]) -> dict[str, jnp.ndarray | int]:
+        return {
+            "edge_features": jax.device_put(jnp.asarray(batch["edge_features"], dtype=dtype)),
+            "neighbor_idx": jax.device_put(jnp.asarray(batch["neighbor_idx"], dtype=jnp.int32)),
+            "sequence_tokens": jax.device_put(jnp.asarray(batch["sequence_tokens"], dtype=jnp.int32)),
+            "residue_mask": jax.device_put(jnp.asarray(batch["residue_mask"], dtype=jnp.float32)),
+            "decode_mask": jax.device_put(jnp.asarray(batch["decode_mask"], dtype=jnp.float32)),
+            "token_count": int(batch["token_count"]),
+            "padded_length": int(batch["padded_length"]),
+        }
+
+    queue: deque[dict[str, jnp.ndarray | int]] = deque()
+    for batch in host_batches:
+        queue.append(_to_device(batch))
+        if len(queue) > depth:
+            yield queue.popleft()
+    while queue:
+        yield queue.popleft()
+
+
 def _summarize_examples(tag: str, examples: list[GraphExample]) -> None:
     lengths = np.asarray([ex.sequence_tokens.shape[0] for ex in examples], dtype=np.float32)
     token_counts = np.asarray([float(np.sum(ex.residue_mask > 0.5)) for ex in examples], dtype=np.float32)
@@ -406,6 +449,9 @@ def _default_config() -> dict[str, Any]:
             "output_dir": "./outputs_jax_train",
             "num_epochs": 1,
             "tokens_per_batch": 2048,
+            "bucket_lengths": [128, 256, 384, 512],
+            "prefetch_depth": 2,
+            "log_every_n_steps": 0,
             "warmup_steps": 4000,
             "clip_grad_norm": 1.0,
             "seed": 0,
@@ -538,20 +584,29 @@ def main() -> None:
             }
         )
 
+    bucket_lengths = [int(v) for v in train_cfg.get("bucket_lengths", [])]
+    prefetch_depth = int(train_cfg.get("prefetch_depth", 2))
+    log_every_n_steps = int(train_cfg.get("log_every_n_steps", 0))
+
     for epoch in range(1, train_cfg["num_epochs"] + 1):
         train_batches = _token_batches(train_examples, train_cfg["tokens_per_batch"], rng, shuffle=True)
-        train_nll_sum = 0.0
-        train_correct_sum = 0.0
-        train_token_sum = 0.0
-        for examples in train_batches:
-            batch = _collate_batch(
+        train_nll_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        train_correct_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        train_token_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        train_host_batches = (
+            _collate_batch(
                 examples=examples,
                 edge_dim=model_cfg["edge_dim"],
                 k_neighbors=model_cfg["k_neighbors"],
-                dtype=dtype,
+                bucket_lengths=bucket_lengths,
             )
+            for examples in train_batches
+        )
+        train_window_tokens = 0
+        train_window_start = time.perf_counter()
+        for step_idx, batch in enumerate(_prefetch_to_device(train_host_batches, prefetch_depth, dtype), start=1):
             jax_rng, subkey = jax.random.split(jax_rng)
-            decode_noise = jnp.abs(jax.random.normal(subkey, shape=batch["decode_mask"].shape, dtype=jnp.float32))
+            decode_noise = jnp.abs(jax.random.normal(subkey, shape=batch["decode_mask"].shape, dtype=dtype))
             nll_sum, correct_sum, token_count = train_step(
                 model=model,
                 optimizer=optimizer,
@@ -562,23 +617,45 @@ def main() -> None:
                 decode_mask=batch["decode_mask"],
                 decode_noise=decode_noise,
             )
-            train_nll_sum += float(nll_sum)
-            train_correct_sum += float(correct_sum)
-            train_token_sum += float(token_count)
+            train_nll_sum = train_nll_sum + nll_sum
+            train_correct_sum = train_correct_sum + correct_sum
+            train_token_sum = train_token_sum + token_count
+            train_window_tokens += int(batch["token_count"])
+            if log_every_n_steps > 0 and step_idx % log_every_n_steps == 0:
+                elapsed = max(1e-8, time.perf_counter() - train_window_start)
+                tokens_per_sec = train_window_tokens / elapsed
+                print(
+                    f"epoch={epoch} step={step_idx} padded_len={batch['padded_length']} "
+                    f"tokens_per_sec={tokens_per_sec:.1f}"
+                )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "epoch": epoch,
+                            "train/step": step_idx,
+                            "train/tokens_per_sec_step": tokens_per_sec,
+                            "train/padded_length": int(batch["padded_length"]),
+                        }
+                    )
+                train_window_tokens = 0
+                train_window_start = time.perf_counter()
 
         valid_batches = _token_batches(valid_examples, train_cfg["tokens_per_batch"], rng, shuffle=False)
-        valid_nll_sum = 0.0
-        valid_correct_sum = 0.0
-        valid_token_sum = 0.0
-        for examples in valid_batches:
-            batch = _collate_batch(
+        valid_nll_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        valid_correct_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        valid_token_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        valid_host_batches = (
+            _collate_batch(
                 examples=examples,
                 edge_dim=model_cfg["edge_dim"],
                 k_neighbors=model_cfg["k_neighbors"],
-                dtype=dtype,
+                bucket_lengths=bucket_lengths,
             )
+            for examples in valid_batches
+        )
+        for batch in _prefetch_to_device(valid_host_batches, prefetch_depth, dtype):
             jax_rng, subkey = jax.random.split(jax_rng)
-            decode_noise = jnp.abs(jax.random.normal(subkey, shape=batch["decode_mask"].shape, dtype=jnp.float32))
+            decode_noise = jnp.abs(jax.random.normal(subkey, shape=batch["decode_mask"].shape, dtype=dtype))
             nll_sum, correct_sum, token_count = eval_step(
                 model=model,
                 edge_features=batch["edge_features"],
@@ -588,12 +665,20 @@ def main() -> None:
                 decode_mask=batch["decode_mask"],
                 decode_noise=decode_noise,
             )
-            valid_nll_sum += float(nll_sum)
-            valid_correct_sum += float(correct_sum)
-            valid_token_sum += float(token_count)
+            valid_nll_sum = valid_nll_sum + nll_sum
+            valid_correct_sum = valid_correct_sum + correct_sum
+            valid_token_sum = valid_token_sum + token_count
 
-        train_metrics = _metric_from_sums(train_nll_sum, train_correct_sum, train_token_sum)
-        valid_metrics = _metric_from_sums(valid_nll_sum, valid_correct_sum, valid_token_sum)
+        train_metrics = _metric_from_sums(
+            float(jax.device_get(train_nll_sum)),
+            float(jax.device_get(train_correct_sum)),
+            float(jax.device_get(train_token_sum)),
+        )
+        valid_metrics = _metric_from_sums(
+            float(jax.device_get(valid_nll_sum)),
+            float(jax.device_get(valid_correct_sum)),
+            float(jax.device_get(valid_token_sum)),
+        )
         report = {
             "epoch": epoch,
             "train": train_metrics,
