@@ -11,7 +11,7 @@ from decoding import (
     conditional_probs_decode,
     unconditional_probs_decode,
 )
-
+from tqdm import tqdm
 class ProteinMPNN(nnx.Module):
     def __init__(self, num_letters, node_features, edge_features,
                  hidden_dim, rngs: nnx.Rngs, num_encoder_layers=30, 
