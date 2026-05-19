@@ -1,8 +1,11 @@
+from collections import OrderedDict
+from pathlib import Path
+
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-import flax.nnx as nnx
 import numpy as np
-from collections import OrderedDict
+import pytest
 
 from graph_features import ProteinMPNNFeaturizer
 from model import ProteinMPNN
@@ -10,8 +13,8 @@ from protein_mpnn_utils import ALPHABET
 from weights import load_torch_vanilla_checkpoint
 
 
-WEIGHTS_PATH = "/Users/thom/Projects/references/ProteinMPNN/vanilla_model_weights/v_48_020.pt"
-PDB_PATH = "/Users/thom/tmp_data/tmp_data/data/predictions/run/sequences/Q9Y6G3/esmfold/structure.pdb"
+WEIGHTS_PATH = Path("/Users/thom/Projects/references/ProteinMPNN/vanilla_model_weights/v_48_020.pt")
+PDB_PATH = Path("/Users/thom/tmp_data/tmp_data/data/predictions/run/sequences/Q9Y6G3/esmfold/structure.pdb")
 
 AA3_TO_1 = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -21,10 +24,10 @@ AA3_TO_1 = {
 }
 
 
-def _extract_single_chain_backbone(path):
+def _extract_single_chain_backbone(path: Path):
     residues = OrderedDict()
     chain_id = None
-    with open(path, "r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.startswith("ATOM"):
                 continue
@@ -77,6 +80,11 @@ def _extract_single_chain_backbone(path):
     return atom_coords, sequence_tokens, residue_mask, chain_ids, residue_idx
 
 
+@pytest.mark.integration
+@pytest.mark.skipif(
+    (not WEIGHTS_PATH.exists()) or (not PDB_PATH.exists()),
+    reason="External checkpoint/PDB paths unavailable",
+)
 def test_weight_loading_and_forward_pass():
     atom_coords, sequence_tokens, residue_mask, chain_ids, residue_idx = _extract_single_chain_backbone(PDB_PATH)
     decode_mask = residue_mask
@@ -104,7 +112,7 @@ def test_weight_loading_and_forward_pass():
         ca_only=False,
     )
 
-    load_torch_vanilla_checkpoint(WEIGHTS_PATH, model=model, featurizer=featurizer)
+    load_torch_vanilla_checkpoint(str(WEIGHTS_PATH), model=model, featurizer=featurizer)
 
     edge_features, neighbor_idx = featurizer(
         atom_coords=atom_coords,
@@ -126,11 +134,3 @@ def test_weight_loading_and_forward_pass():
     assert jnp.all(jnp.isfinite(log_probs))
     probs = jnp.exp(log_probs)
     assert jnp.allclose(jnp.sum(probs, axis=-1), 1.0, atol=1e-4)
-
-    print("weight loading + forward pass: OK")
-    print("sequence length:", int(sequence_tokens.shape[1]))
-    print("log_probs shape:", tuple(log_probs.shape))
-
-
-if __name__ == "__main__":
-    test_weight_loading_and_forward_pass()

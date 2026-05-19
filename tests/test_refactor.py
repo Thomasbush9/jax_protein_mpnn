@@ -1,6 +1,6 @@
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-import flax.nnx as nnx
 
 from graph_features import ProteinMPNNFeaturizer
 from model import ProteinMPNN
@@ -105,8 +105,3 @@ def test_shapes_and_determinism():
     )
     assert conditional.shape == (1, 6, 21)
     assert unconditional.shape == (1, 6, 21)
-
-
-if __name__ == "__main__":
-    test_shapes_and_determinism()
-    print("tests_refactor: OK")

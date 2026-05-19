@@ -1,4 +1,6 @@
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any
 import numpy as np
 import jax.numpy as jnp
 
@@ -9,6 +11,63 @@ import itertools
 
 ALPHABET = "ACDEFGHIKLMNPQRSTVWYX"
 N_AA = len(ALPHABET)  # 21
+
+
+@dataclass
+class TiedFeaturizeOutput:
+    X: jnp.ndarray
+    S: jnp.ndarray
+    mask: jnp.ndarray
+    lengths: jnp.ndarray
+    chain_M: jnp.ndarray
+    chain_encoding_all: jnp.ndarray
+    letter_list_list: list[list[str]]
+    visible_list_list: list[list[str]]
+    masked_list_list: list[list[str]]
+    masked_chain_length_list_list: list[list[int]]
+    chain_M_pos: jnp.ndarray
+    omit_AA_mask: jnp.ndarray
+    residue_idx: jnp.ndarray
+    dihedral_mask: jnp.ndarray
+    tied_pos_list_of_lists_list: list[list[list[int]]]
+    pssm_coef_all: jnp.ndarray
+    pssm_bias_all: jnp.ndarray
+    pssm_log_odds_all: jnp.ndarray
+    bias_by_res_all: jnp.ndarray
+    tied_beta_all: jnp.ndarray
+
+    def as_tuple(self) -> tuple[Any, ...]:
+        return (
+            self.X,
+            self.S,
+            self.mask,
+            self.lengths,
+            self.chain_M,
+            self.chain_encoding_all,
+            self.letter_list_list,
+            self.visible_list_list,
+            self.masked_list_list,
+            self.masked_chain_length_list_list,
+            self.chain_M_pos,
+            self.omit_AA_mask,
+            self.residue_idx,
+            self.dihedral_mask,
+            self.tied_pos_list_of_lists_list,
+            self.pssm_coef_all,
+            self.pssm_bias_all,
+            self.pssm_log_odds_all,
+            self.bias_by_res_all,
+            self.tied_beta_all,
+        )
+
+    def __iter__(self):
+        return iter(self.as_tuple())
+
+    def __getitem__(self, idx):
+        return self.as_tuple()[idx]
+
+    def __len__(self) -> int:
+        return 20
 
 # utility functions 
 #TODO can it be improved? 
@@ -315,7 +374,8 @@ def tied_featurize(
 ):
     """Pack a list of parsed-PDB dicts into padded batch arrays for ProteinMPNN.
 
-    Returns a tuple of tensors (see model README for the full list); shapes
+    Returns a `TiedFeaturizeOutput` dataclass; it preserves legacy tuple-style
+    unpacking/indexing via `__iter__` and `__getitem__`. Shapes
     use B = batch size, L = L_max = longest concatenated chain in the batch.
     """
     B = len(batch)
@@ -427,27 +487,27 @@ def tied_featurize(
     X_out = X[:, :, 0] if ca_only else X
 
     # Final cast: numpy → jnp. JAX handles device placement implicitly.
-    return (
-        jnp.asarray(X_out, dtype=jnp.float32),
-        jnp.asarray(S, dtype=jnp.int32),
-        jnp.asarray(mask, dtype=jnp.float32),
-        jnp.asarray(lengths, dtype=jnp.int32),
-        jnp.asarray(chain_M, dtype=jnp.float32),
-        jnp.asarray(chain_encoding_all, dtype=jnp.int32),
-        letter_list_list,
-        visible_list_list,
-        masked_list_list,
-        masked_chain_length_list_list,
-        jnp.asarray(chain_M_pos, dtype=jnp.float32),
-        jnp.asarray(omit_AA_mask, dtype=jnp.int32),
-        jnp.asarray(residue_idx, dtype=jnp.int32),
-        jnp.asarray(dihedral_mask, dtype=jnp.float32),
-        tied_pos_list_of_lists_list,
-        jnp.asarray(pssm_coef_all, dtype=jnp.float32),
-        jnp.asarray(pssm_bias_all, dtype=jnp.float32),
-        jnp.asarray(pssm_log_odds_all, dtype=jnp.float32),
-        jnp.asarray(bias_by_res_all, dtype=jnp.float32),
-        jnp.asarray(tied_beta_all, dtype=jnp.float32),
+    return TiedFeaturizeOutput(
+        X=jnp.asarray(X_out, dtype=jnp.float32),
+        S=jnp.asarray(S, dtype=jnp.int32),
+        mask=jnp.asarray(mask, dtype=jnp.float32),
+        lengths=jnp.asarray(lengths, dtype=jnp.int32),
+        chain_M=jnp.asarray(chain_M, dtype=jnp.float32),
+        chain_encoding_all=jnp.asarray(chain_encoding_all, dtype=jnp.int32),
+        letter_list_list=letter_list_list,
+        visible_list_list=visible_list_list,
+        masked_list_list=masked_list_list,
+        masked_chain_length_list_list=masked_chain_length_list_list,
+        chain_M_pos=jnp.asarray(chain_M_pos, dtype=jnp.float32),
+        omit_AA_mask=jnp.asarray(omit_AA_mask, dtype=jnp.int32),
+        residue_idx=jnp.asarray(residue_idx, dtype=jnp.int32),
+        dihedral_mask=jnp.asarray(dihedral_mask, dtype=jnp.float32),
+        tied_pos_list_of_lists_list=tied_pos_list_of_lists_list,
+        pssm_coef_all=jnp.asarray(pssm_coef_all, dtype=jnp.float32),
+        pssm_bias_all=jnp.asarray(pssm_bias_all, dtype=jnp.float32),
+        pssm_log_odds_all=jnp.asarray(pssm_log_odds_all, dtype=jnp.float32),
+        bias_by_res_all=jnp.asarray(bias_by_res_all, dtype=jnp.float32),
+        tied_beta_all=jnp.asarray(tied_beta_all, dtype=jnp.float32),
     )
 
 
